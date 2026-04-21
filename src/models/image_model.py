@@ -111,13 +111,14 @@ class GLC_Image(CompressionModel):
         self.q_dec = nn.Parameter(interpolated_weights.view(64, 256, 1, 1))
 
     def test(self, x, q_index):
+        # x [1, 3, 1088, 1920]
         curr_q_enc = self.q_enc[q_index:q_index + 1, :, :, :]
         curr_q_dec = self.q_dec[q_index:q_index + 1, :, :, :]
 
         y_ori = self.vqgan.encoder(x)
-        y = self.enc(y_ori, curr_q_enc)
+        y = self.enc(y_ori, curr_q_enc) # [1, 256, 68, 120]
 
-        z = self.hyper_enc(y)
+        z = self.hyper_enc(y) # [1, 256, 17, 30]
         
         index = self.z_vq.get_indices(z)
         z_hat = self.z_vq.get_quan_feat(index, (z.shape[0], z.shape[2], z.shape[3], z.shape[1]))
@@ -144,6 +145,92 @@ class GLC_Image(CompressionModel):
             "ref_latent": y_hat,
         }
         return result
+
+    def compress(self, x, q_index):
+        _, _, H, W = x.shape
+        device = x.device
+        curr_q_enc = self.q_enc[q_index:q_index + 1, :, :, :]
+        curr_q_dec = self.q_dec[q_index:q_index + 1, :, :, :]
+
+        y_ori = self.vqgan.encoder(x)
+        y = self.enc(y_ori, curr_q_enc)
+
+        z = self.hyper_enc(y)
+
+        index = self.z_vq.get_indices(z) # [H_z * W_z, 1]
+        z_hat = self.z_vq.get_quan_feat(index, (z.shape[0], z.shape[2], z.shape[3], z.shape[1]))
+
+        params = self.hyper_dec(z_hat)
+        params = self.y_prior_fusion(params)
+        y_q_w_0, y_q_w_1, y_q_w_2, y_q_w_3, s_w_0, s_w_1, s_w_2, s_w_3, y_hat = self.compress_four_part_prior(
+            y, params, self.y_spatial_prior_adaptor_1, self.y_spatial_prior_adaptor_2,
+            self.y_spatial_prior_adaptor_3, self.y_spatial_prior,
+            y_spatial_prior_reduction=self.y_spatial_prior_reduction)
+
+        cuda_event = torch.cuda.Event()
+        cuda_event.record()
+
+        y_hat = self.dec(y_hat, curr_q_dec)
+        x_hat = self.vqgan.generator(y_hat)
+
+        # perform z-index bitstream gen
+        z_bitstream = self.encode_z_index(index, round(math.log2(self.codebook_size)))
+
+        cuda_stream = self.get_cuda_stream(device=device, priority=-1)
+        with torch.cuda.stream(cuda_stream):
+            cuda_event.wait()
+            self.entropy_coder.reset()
+            self.gaussian_encoder.encode_y(y_q_w_0, s_w_0)
+            self.gaussian_encoder.encode_y(y_q_w_1, s_w_1)
+            self.gaussian_encoder.encode_y(y_q_w_2, s_w_2)
+            self.gaussian_encoder.encode_y(y_q_w_3, s_w_3)
+            self.entropy_coder.flush()
+
+        y_bitstream = self.entropy_coder.get_encoded_stream()
+        torch.cuda.synchronize(device=device)
+
+        result = {
+            'bitstream': z_bitstream + y_bitstream,
+            'x_hat': x_hat,
+            "ref_latent": y_hat,
+        }
+        return result
+
+    def decompress(self, bitstream, sps, q_index):
+        dtype = next(self.parameters()).dtype
+        device = next(self.parameters()).device
+        curr_q_dec = self.q_dec[q_index:q_index + 1, :, :, :]
+
+        padding_l, padding_r, padding_t, padding_b = self.get_padding_size(sps['height'], sps['width'], 64)
+        H = sps['height'] + padding_t + padding_b
+        W = sps['width'] + padding_l + padding_r
+        num_indices = (H // 64) * (W // 64)
+        bits_per_index = round(math.log2(self.codebook_size))
+        spliter = math.ceil(num_indices * bits_per_index / 8)
+        z_bitstream = bitstream[:spliter]
+        y_bitstream = bitstream[spliter:]
+
+        z_index = self.decode_z_index(z_bitstream, num_indices, round(math.log2(self.codebook_size)))
+        z_hat = self.z_vq.get_quan_feat(z_index.to(device), (1, H//64, W//64, 256))
+
+        self.entropy_coder.set_use_two_entropy_coders(sps['ec_part'] == 1)
+        self.entropy_coder.set_stream(y_bitstream)
+        params = self.hyper_dec(z_hat)
+        params = self.y_prior_fusion(params)
+
+        y_hat = self.decompress_four_part_prior(
+            params, self.y_spatial_prior_adaptor_1, self.y_spatial_prior_adaptor_2,
+            self.y_spatial_prior_adaptor_3, self.y_spatial_prior,
+            y_spatial_prior_reduction=self.y_spatial_prior_reduction)
+
+        y_hat = self.dec(y_hat, curr_q_dec)
+        x_hat = self.vqgan.generator(y_hat)
+
+        return {
+            'x_hat': x_hat,
+            'ref_latent': y_hat,
+        }
+
 
     def recon_with_z(self, x, q_index=None):
         curr_q_enc = self.q_enc[q_index:q_index + 1, :, :, :]

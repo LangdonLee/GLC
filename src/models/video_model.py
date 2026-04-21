@@ -297,16 +297,16 @@ class GLC_Video(CompressionModel):
         latent_ori = self.vqgan.encoder(x)
 
         # codec
-        y = self.encoder(latent_ori, context, y_q_enc)
+        y = self.encoder(latent_ori, context, y_q_enc) # [1, 256, 68, 120]
 
         temporal_params = self.temporal_prior_encoder(context)
         weight_map = self.weight_generator(temporal_params)
 
         temporal_cond = self.temporal_cond(context)
-        hyper_inp = self.y_temporal_combine(y, temporal_cond)
+        hyper_inp = self.y_temporal_combine(y, temporal_cond) # [1, 384, 68, 120]
         hyper_inp, slice_shape = self.pad_for_y(hyper_inp)
 
-        z = self.hyper_tokenizer(hyper_inp, weight_map)
+        z = self.hyper_tokenizer(hyper_inp, weight_map) # [1, 256, 16, 1]
         z_hat, z_vq_loss, z_vq_info = self.z_vq(z)
     
         # count z bits
@@ -353,3 +353,118 @@ class GLC_Video(CompressionModel):
                 "bit_z": bit_z,
                 "z_vq_loss": z_vq_loss,
             }
+
+    def compress(self, x, dpb, q_index, fa_idx=0):
+        # x [1, 3, 1088, 1920]
+        device = x.device
+        index = torch.tensor([q_index], dtype=torch.int32, device=x.device)
+        y_q_enc = torch.index_select(self.y_q_enc, 0, index)
+        y_q_dec = torch.index_select(self.y_q_dec, 0, index)
+
+        # temporal context
+        context = self.context_generation(dpb, fa_idx)
+
+        # vqgan encoder
+        latent_ori = self.vqgan.encoder(x)
+
+        # codec
+        y = self.encoder(latent_ori, context, y_q_enc) # [1, 256, 68, 120]
+
+        temporal_params = self.temporal_prior_encoder(context)
+        weight_map = self.weight_generator(temporal_params)
+
+        temporal_cond = self.temporal_cond(context)
+        hyper_inp = self.y_temporal_combine(y, temporal_cond) # [1, 384, 68, 120]
+        hyper_inp, slice_shape = self.pad_for_y(hyper_inp) # slice_shape (0, 0, 0, 0)
+
+        z = self.hyper_tokenizer(hyper_inp, weight_map)
+        # index, z_hat = self.z_vq.forward_encode(z) # index [K, 1], z_hat [1, 256, K, 1]
+        index = self.z_vq.get_indices(z)
+        z_hat = self.z_vq.get_quan_feat(index, (1, self.hyper_K, 1, 256))
+        assert index.numel() == self.hyper_K
+
+        hierarchical_params = self.hyper_inv_tokenizer(z_hat, weight_map)
+        hierarchical_params = self.slice_to_y(hierarchical_params, slice_shape)
+
+        params = self.res_prior_param_decoder(hierarchical_params, dpb, temporal_params)
+        y_q_w_0, y_q_w_1, s_w_0, s_w_1, y_hat = self.compress_dual_prior(y, params, self.y_spatial_prior) # y_q_w_0 [1, 128, 68, 120]
+
+        cuda_event_y_ready = torch.cuda.Event()
+        cuda_event_y_ready.record()
+
+        # perform z-index bitstream gen
+        bits_per_index = round(math.log2(self.codebook_size))
+        z_bitstream = self.encode_z_index(index, bits_per_index)
+
+        cuda_stream = self.get_cuda_stream(device=device, priority=-1)
+        with torch.cuda.stream(cuda_stream):
+            self.entropy_coder.reset()
+            cuda_event_y_ready.wait()
+            self.gaussian_encoder.encode_y(y_q_w_0, s_w_0)
+            self.gaussian_encoder.encode_y(y_q_w_1, s_w_1)
+            self.entropy_coder.flush()
+
+        y_bitstream = self.entropy_coder.get_encoded_stream()
+
+        torch.cuda.synchronize(device=device)
+
+        rec_latent = self.decoder(y_hat, context, y_q_dec)
+
+        x_hat = self.vqgan.generator(rec_latent)
+        x_hat = x_hat.clamp_(-1, 1)
+
+        return {
+            'dpb': {
+                'ref_frame': x_hat,
+                'ref_latent': rec_latent,
+                'latent_ori': latent_ori,
+                'ref_y': y_hat,
+            },
+            'bitstream': z_bitstream + y_bitstream,
+        }
+
+    def decompress(self, bitstream, sps, q_index, dpb, fa_idx=0):
+        device = next(self.parameters()).device
+        index = torch.tensor([q_index], dtype=torch.int32, device=device)
+        y_q_dec = torch.index_select(self.y_q_dec, 0, index)
+
+        # obtain temporal info
+        context = self.context_generation(dpb, fa_idx)
+        temporal_params = self.temporal_prior_encoder(context)
+        weight_map = self.weight_generator(temporal_params)
+
+        bits_per_index = round(math.log2(self.codebook_size))
+        num_indices = self.hyper_K
+        spliter = math.ceil(num_indices * bits_per_index / 8)
+        z_bitstream = bitstream[:spliter]
+        y_bitstream = bitstream[spliter:]
+
+        z_index = self.decode_z_index(z_bitstream, num_indices, bits_per_index)
+        z_hat = self.z_vq.get_quan_feat(z_index.to(device), (1, self.hyper_K, 1, 256))
+
+        self.entropy_coder.set_use_two_entropy_coders(sps['ec_part'] == 1)
+        self.entropy_coder.set_stream(y_bitstream)
+        hierarchical_params = self.hyper_inv_tokenizer(z_hat, weight_map)
+        hierarchical_params = self.slice_to_y(hierarchical_params, slice_shape=(0, 0, 0, 0))
+
+        params = self.res_prior_param_decoder(hierarchical_params, dpb, temporal_params)
+        infos = self.decompress_prior_2x_part1(params)
+
+        cuda_stream = self.get_cuda_stream(device=device, priority=-1)
+        with torch.cuda.stream(cuda_stream):
+            y_hat = self.decompress_prior_2x_part2(params, self.y_spatial_prior, infos)
+            cuda_event = torch.cuda.Event()
+            cuda_event.record()
+
+        cuda_event.wait()
+
+        rec_latent = self.decoder(y_hat, context, y_q_dec)
+
+        x_hat = self.vqgan.generator(rec_latent)
+        x_hat = x_hat.clamp_(-1, 1)
+
+        return {
+            'ref_frame': x_hat,
+            'ref_latent': rec_latent,
+            'ref_y': y_hat,
+        }

@@ -6,6 +6,7 @@ import json
 import multiprocessing
 import os
 import time
+import io
 
 import torch
 import torch.nn.functional as F
@@ -17,6 +18,11 @@ from src.models.video_model import GLC_Video
 from src.utils.test_utils import PNGReader, PNGWriter, str2bool, create_folder, generate_log_json, get_state_dict, dump_json, \
     from_0_1_to_minus1_1, from_minus1_1_to_0_1, set_torch_env
 from src.utils.metrics_video import calc_psnr, calc_msssim_rgb
+from src.utils.stream_helper import SPSHelper, write_sps, write_ip, read_header, NalType, read_sps_remaining, read_ip_remaining
+
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 
 def parse_args():
@@ -44,6 +50,7 @@ def parse_args():
     parser.add_argument('--check_existing', type=str2bool, default=False)
     parser.add_argument('--stream_path', type=str, default="out_bin")
     parser.add_argument('--save_decoded_frame', type=str2bool, default=False)
+    parser.add_argument('--write_stream', type=str2bool, default=False)
     parser.add_argument('--output_path', type=str, required=True)
     parser.add_argument('--verbose_json', type=str2bool, default=False)
     parser.add_argument('--verbose', type=int, default=0)
@@ -175,6 +182,191 @@ def run_one_point(p_frame_net, i_frame_net, lpips_metric, dists_metric, args):
     return log_result
 
 
+def run_one_point_with_stream(p_frame_net, i_frame_net, lpips_metric, dists_metric, args):
+    frame_num = args['frame_num']
+    rate_gop_size = args['rate_gop_size']
+    verbose = args['verbose']
+    reset_interval = args['reset_interval']
+    verbose_json = args['verbose_json']
+    device = next(i_frame_net.parameters()).device
+    save_decoded_frame = args['save_decoded_frame']
+
+    frame_types = []
+    psnrs = []
+    msssims = []
+    bits = []
+    lpips_list = []
+    dists_list = []
+    index_map = [0, 1, 0, 2, 0, 2, 0, 2]
+
+    start_time = time.time()
+    encoding_time = []
+    decoding_time = []
+    src_reader = PNGReader(args['src_path'], args['src_width'], args['src_height'])
+    pic_height = args['src_height']
+    pic_width = args['src_width']
+    padding_l, padding_r, padding_t, padding_b = GLC_Image.get_padding_size(pic_height, pic_width, 64)
+
+    # Encoding
+    use_two_entropy_coders = pic_height * pic_width > 1280 * 720
+    i_frame_net.set_use_two_entropy_coders(use_two_entropy_coders)
+    p_frame_net.set_use_two_entropy_coders(use_two_entropy_coders)
+
+    output_buff = io.BytesIO()
+    sps_helper = SPSHelper()
+
+    with torch.no_grad():
+        for frame_idx in range(frame_num):
+            x, rgb = get_src_frame(args, src_reader, device)
+            torch.cuda.synchronize(device=device)
+            frame_start_time = time.time()
+
+            x_padded = F.pad(x, (padding_l, padding_r, padding_t, padding_b), mode="replicate")
+            x_padded = from_0_1_to_minus1_1(x_padded)
+
+            is_i_frame = False
+            if frame_idx % args['intra_period'] == 0:
+                is_i_frame = True
+                sps = {
+                    'sps_id': -1,
+                    'height': pic_height,
+                    'width': pic_width,
+                    'ec_part': 1 if use_two_entropy_coders else 0,
+                    'use_ada_i': 0,
+                }
+
+                curr_qp = args['q_index_i']
+                encoded = i_frame_net.compress(x_padded, args['q_index_i'])
+                dpb = {
+                    "ref_frame": encoded['x_hat'],
+                    "ref_latent": encoded['ref_latent'],
+                    "ref_y": None
+                }
+                # recon_frame = encoded['x_hat']
+
+                frame_types.append(0)
+                bits.append(0.)
+            else:
+                use_ada_i = 0
+                if reset_interval > 0 and frame_idx % reset_interval == 1:
+                    dpb["ref_y"] = None
+                    use_ada_i = 1
+                fa_idx = index_map[frame_idx % rate_gop_size]
+                sps = {
+                    'sps_id': -1,
+                    'height': pic_height,
+                    'width': pic_width,
+                    'ec_part': 1 if use_two_entropy_coders else 0,
+                    'use_ada_i': use_ada_i,
+                }
+                curr_qp = args['q_index_p'] + fa_idx # reminder: GLC doesn't shift qp, just use this to store fa_idx
+                encoded = p_frame_net.compress(x_padded, dpb, args['q_index_p'],
+                                           fa_idx=fa_idx)
+                dpb = encoded['dpb']
+
+                # recon_frame = dpb["ref_frame"]
+                frame_types.append(1)
+                bits.append(0.)
+
+            sps_id, sps_new = sps_helper.get_sps_id(sps)
+            sps['sps_id'] = sps_id
+            if sps_new:
+                write_sps(output_buff, sps)
+            write_ip(output_buff, is_i_frame, sps_id, curr_qp, encoded['bitstream'])
+            torch.cuda.synchronize(device=device)
+            frame_end_time = time.time()
+            frame_time = frame_end_time - frame_start_time
+            encoding_time.append(frame_time)
+
+    src_reader.close()
+    with open(args['curr_bin_path'], "wb") as output_file:
+        bytes_buffer = output_buff.getbuffer()
+        output_file.write(bytes_buffer)
+        bytes_buffer.release()
+    output_buff.close()
+
+    # Decoding
+    sps_helper = SPSHelper()
+    with open(args['curr_bin_path'], "rb") as input_file:
+        input_buff = io.BytesIO(input_file.read())
+    decoded_frame_number = 0
+    src_reader = PNGReader(args['src_path'], args['src_width'], args['src_height'])
+    if save_decoded_frame:
+        recon_writer = PNGWriter(args['curr_rec_path'], args['src_width'], args['src_height'])
+
+    with torch.no_grad():
+        qp_std = 0
+        while decoded_frame_number < frame_num:
+            x, rgb = get_src_frame(args, src_reader, device)
+            torch.cuda.synchronize(device=device)
+            frame_start_time = time.time()
+
+            header = read_header(input_buff)
+            while header['nal_type'] == NalType.NAL_SPS:
+                sps = read_sps_remaining(input_buff, header['sps_id'])
+                sps_helper.add_sps_by_id(sps)
+                header = read_header(input_buff)
+                continue
+            sps_id = header['sps_id']
+
+            sps = sps_helper.get_sps_by_id(sps_id)
+            qp, bit_stream = read_ip_remaining(input_buff)
+
+            if header['nal_type'] == NalType.NAL_I:
+                decoded = i_frame_net.decompress(bit_stream, sps, qp)
+                qp_std = qp
+                dpb = {
+                    "ref_frame": decoded['x_hat'],
+                    "ref_latent": decoded['ref_latent'],
+                    "ref_y": None
+                }
+                recon_frame = decoded['x_hat']
+            elif header['nal_type'] == NalType.NAL_P:
+                if sps['use_ada_i'] == 1:
+                    dpb["ref_y"] = None
+                fa_idx = qp - qp_std # read qp = qp_i + fa_idx
+                decoded = p_frame_net.decompress(bit_stream, sps, qp_std, dpb, fa_idx)
+                dpb = decoded
+                recon_frame = decoded['ref_frame']
+
+            # align input/output range
+            recon_frame = recon_frame.clamp(-1, 1)
+            recon_frame = from_minus1_1_to_0_1(recon_frame)
+
+            x_hat = F.pad(recon_frame, (-padding_l, -padding_r, -padding_t, -padding_b))
+            torch.cuda.synchronize(device=device)
+            frame_end_time = time.time()
+            frame_time = frame_end_time - frame_start_time
+            decoding_time.append(frame_time)
+
+            rgb_rec = x_hat.squeeze(0).cpu().numpy()
+            curr_psnr, curr_ssim = get_distortion(args, rgb_rec, rgb)
+
+            curr_dists = dists_metric(x, x_hat).item()
+            curr_lpips = lpips_metric.forward(x * 2 - 1, x_hat * 2 - 1).item()
+            psnrs.append(curr_psnr)
+            msssims.append(curr_ssim)
+            lpips_list.append(curr_lpips)
+            dists_list.append(curr_dists)
+
+            if save_decoded_frame:
+                recon_writer.write_one_frame(rgb_rec)
+
+            decoded_frame_number += 1
+
+    src_reader.close()
+    if save_decoded_frame:
+        recon_writer.close()
+    test_time = time.time() - start_time
+
+    log_result = generate_log_json(frame_num, pic_height * pic_width, test_time,
+                                   frame_types, bits, psnrs, msssims, lpips_list=lpips_list, dists_list=dists_list,
+                                   verbose=verbose_json)
+    with open(args['curr_json_path'], 'w') as fp:
+        json.dump(log_result, fp, indent=2)
+    return log_result
+
+
 i_frame_net = None  # the model is initialized after each process is spawn, thus OK for multiprocess
 p_frame_net = None
 lpips_metric = None
@@ -188,16 +380,20 @@ def worker(args):
     global dists_metric
 
     sub_dir_name = args['seq']
-    bin_folder = os.path.join(args['stream_path'], args['ds_name'])
+    bin_folder = os.path.join(args['stream_path'], args['ds_name'], f"q{args['q_index_i']}")
+    create_folder(bin_folder, True)
 
     args['src_path'] = os.path.join(args['dataset_path'], sub_dir_name)
     args['bin_folder'] = bin_folder
-    args['curr_bin_path'] = os.path.join(bin_folder,
-                                         f"{args['seq']}_q{args['q_index_i']}.bin")
+    args['curr_bin_path'] = os.path.join(bin_folder, f"{args['seq']}.bin")
     args['curr_rec_path'] = args['curr_bin_path'].replace('.bin', '')
     args['curr_json_path'] = args['curr_bin_path'].replace('.bin', '.json')
 
-    result = run_one_point(p_frame_net, i_frame_net, lpips_metric, dists_metric, args)
+    if args['write_stream']:
+        result = run_one_point_with_stream(p_frame_net, i_frame_net, lpips_metric, dists_metric, args)
+    else:
+        result = run_one_point(p_frame_net, i_frame_net, lpips_metric, dists_metric, args)
+
 
     result['ds_name'] = args['ds_name']
     result['seq'] = args['seq']
@@ -231,6 +427,7 @@ def init_func(args, gpu_num):
     i_frame_net.interpolate_q()
     i_frame_net = i_frame_net.to(device)
     i_frame_net.eval()
+    i_frame_net.update(args.force_zero_thres)
 
     global p_frame_net
     p_state_dict = get_state_dict(args.model_path_p)
@@ -238,6 +435,7 @@ def init_func(args, gpu_num):
     p_frame_net.load_state_dict(p_state_dict, strict=False)
     p_frame_net = p_frame_net.to(device)
     p_frame_net.eval()
+    p_frame_net.update(args.force_zero_thres)
 
     from src.utils.lpips import LPIPS
     from src.utils.DISTS_pytorch import DISTS
@@ -348,6 +546,7 @@ def main():
                 cur_args['ds_name'] = ds_name
                 cur_args['verbose'] = args.verbose
                 cur_args['verbose_json'] = args.verbose_json
+                cur_args['write_stream'] = args.write_stream
 
                 count_frames += cur_args['frame_num']
 
