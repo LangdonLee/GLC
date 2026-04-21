@@ -57,6 +57,13 @@ bash test_image.sh
 bash test_video.sh
 ```
 
+To write actual bitstreams, you need to compile the arithmetic code first:
+```bash
+cd ./src/cpp/
+pip install .
+```
+Then use the `write_stream` flag to generate actual `.bin` files under stream path.
+
 
 ## :page_facing_up: Citation
 If you find this work useful for your research, please cite:
